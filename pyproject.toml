@@ -1,0 +1,29 @@
+[project]
+name = "deepseek-modal"
+version = "0.1.0"
+description = "Run DeepSeek-V4.1-Flash (dealignai uncensored FP8 build) on Modal with SGLang and drive it from the command line"
+readme = "README.md"
+authors = [
+    { name = "neka-nat", email = "nekanat.stock@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "modal>=1.6.2",
+    "pydantic>=2.11",
+    "typer>=0.27",
+]
+
+[project.scripts]
+dsv4 = "deepseek_modal.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
