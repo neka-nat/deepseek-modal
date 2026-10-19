@@ -1,13 +1,20 @@
 """`dsv4`: command line client for the deployed Modal app.
 
-Only needs `modal`, `typer` and `pydantic` locally; SGLang and the weights live on Modal. Streaming
-goes over Modal's own RPC (`remote_gen`), so the only credential involved is your Modal token.
+Only needs `modal`, `typer` and `pydantic` locally (aiohttp comes with modal); SGLang and the
+weights live on Modal. Everything goes over Modal's own RPC, so the only credential involved is
+your Modal token, and `dsv4 serve` gives local tools an OpenAI / Anthropic / Responses-compatible
+endpoint without exposing anything publicly.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import socket
+import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +38,7 @@ JOBS_FILE = STATE_DIR / "jobs.jsonl"
 AUTO_DOWN_FILE = STATE_DIR / "auto_down.json"
 DEPLOY_HINT = "run: uv run modal deploy -m deepseek_modal.app"
 EFFORT_HELP = f"Reasoning effort: {', '.join(EFFORT_LEVELS)}, an integer 1-100, or none (thinking off)"
+AGENT_PRESETS = ("claude", "codex", "openai", "anthropic")
 
 
 # ----------------------------------------------------------------- helpers
@@ -119,17 +127,27 @@ def _request(
         _fail(str(exc))
 
 
-def _running_containers(handle: Any) -> int | None:
+def _containers() -> list[dict]:
+    """Running containers of this app, straight from `modal container list --json` (the autoscaler
+    stats only count containers of the current deployment version)."""
     try:
-        stats = handle.get_current_stats()
-    except Exception:  # noqa: BLE001 - best effort
-        return None
-    return getattr(stats, "num_total_runners", None)
+        out = subprocess.run(
+            [sys.executable, "-m", "modal", "container", "list", "--json"], capture_output=True, text=True, timeout=120
+        )
+        rows = json.loads(out.stdout or "[]")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    return [row for row in rows if row.get("App Name") == cfg.APP_NAME or row.get("app_name") == cfg.APP_NAME]
+
+
+def _autoscaler(server: Any) -> Any:
+    """Autoscaler namespace of the server's container pool (shared by all its methods)."""
+    return server.generate.autoscaler
 
 
 def _cold_start_hint(server: Any) -> None:
-    if _running_containers(server.generate) == 0:
-        _note(f"no warm container: cold start ahead (loading 510 GB of weights, 10-25 min, {cfg.hourly_cost_text()})")
+    if not _containers():
+        _note(f"no warm container: cold start ahead (loading 510 GB of weights, 10-15 min, {cfg.hourly_cost_text()})")
 
 
 class _Printer:
@@ -229,6 +247,140 @@ def _emit_result(result: GenerationResult, *, out: Path | None, as_json: bool, p
         typer.echo(result.content)
 
 
+# ---------------------------------------------------------------- local proxy
+def _make_proxy_app(server: Any, effort: Any) -> Any:
+    """aiohttp app that forwards every request to the container over Modal RPC and streams back."""
+    from aiohttp import web
+
+    async def handle(request: Any) -> Any:
+        import modal
+
+        body = await request.read()
+        headers = {k: v for k, v in request.headers.items()}
+        gen = server.proxy.remote_gen.aio(request.method, request.path_qs, headers, body or None, effort)
+        try:
+            head = await gen.__anext__()
+        except modal.exception.RemoteError as exc:
+            return web.json_response({"error": {"message": f"remote failure: {exc}", "type": "proxy_error"}}, status=502)
+        except StopAsyncIteration:
+            return web.json_response({"error": {"message": "empty response from the container"}}, status=502)
+        response = web.StreamResponse(status=head["status"], headers=head.get("headers") or {})
+        await response.prepare(request)
+        try:
+            async for item in gen:
+                data = item.get("data")
+                if data:
+                    await response.write(data)
+            await response.write_eof()
+        except (ConnectionResetError, ConnectionError, modal.exception.RemoteError):
+            pass  # the client went away (or the container failed mid-stream); nothing left to say
+        return response
+
+    proxy = web.Application(client_max_size=256 * 1024 * 1024)
+    proxy.router.add_route("*", "/{tail:.*}", handle)
+    return proxy
+
+
+class _ProxyThread:
+    """Runs the aiohttp proxy on a background thread so `dsv4 agent` can spawn a tool in front of it."""
+
+    def __init__(self, server: Any, effort: Any, host: str, port: int) -> None:
+        self.host, self.port = host, port
+        self._server, self._effort = server, effort
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._ready = threading.Event()
+        self._loop: Any = None
+        self._stop_event: Any = None
+
+    def _run(self) -> None:
+        import asyncio
+
+        from aiohttp import web
+
+        async def main() -> None:
+            self._stop_event = asyncio.Event()
+            runner = web.AppRunner(_make_proxy_app(self._server, self._effort))
+            await runner.setup()
+            site = web.TCPSite(runner, self.host, self.port)
+            await site.start()
+            self._ready.set()
+            try:
+                await self._stop_event.wait()
+            finally:
+                await runner.cleanup()
+
+        self._loop = asyncio.new_event_loop()
+        try:
+            self._loop.run_until_complete(main())
+        finally:
+            self._loop.close()
+
+    def start(self) -> None:
+        self._thread.start()
+        if not self._ready.wait(timeout=30):
+            _fail("the local proxy did not start")
+
+    def stop(self) -> None:
+        if self._loop is not None and self._stop_event is not None:
+            self._loop.call_soon_threadsafe(self._stop_event.set)
+        self._thread.join(timeout=15)
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _agent_env(preset: str, base: str, effort: Any) -> dict[str, str]:
+    """Environment that points a known tool at the local proxy."""
+    level = effort if isinstance(effort, str) else cfg.PROXY_EFFORT if effort is not None else "none"
+    model = cfg.SERVED_MODEL_NAME
+    env = dict(os.environ)
+    if preset in {"claude", "anthropic"}:
+        env.update(
+            {
+                "ANTHROPIC_BASE_URL": base,
+                "ANTHROPIC_AUTH_TOKEN": "dsv4-local",
+                "ANTHROPIC_MODEL": model,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+                "CLAUDE_CODE_SUBAGENT_MODEL": model,
+                "CLAUDE_CODE_EFFORT_LEVEL": level if level in EFFORT_LEVELS else "high",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",  # keeps the prompt prefix stable for SGLang's prefix cache
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(min(cfg.CONTEXT_LEN, 1_000_000)),
+                "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000",
+                "API_TIMEOUT_MS": "3000000",
+            }
+        )
+    if preset in {"codex", "openai"}:
+        env.update({"OPENAI_BASE_URL": f"{base}/v1", "OPENAI_API_KEY": "dsv4-local"})
+    return env
+
+
+def _agent_command(preset: str, args: list[str], base: str, effort: Any) -> list[str]:
+    if preset == "codex":
+        level = effort if isinstance(effort, str) else "high"
+        overrides = {
+            "model_provider": "dsv4",
+            "model": cfg.SERVED_MODEL_NAME,
+            "model_providers.dsv4.name": "DeepSeek-V4.1-Flash on Modal",
+            "model_providers.dsv4.base_url": f"{base}/v1",
+            "model_providers.dsv4.wire_api": "responses",
+            "model_reasoning_effort": level,
+        }
+        cmd = ["codex"]
+        for key, value in overrides.items():
+            cmd += ["-c", f'{key}="{value}"']
+        cmd += ["-c", f"model_context_window={cfg.CONTEXT_LEN}"]
+        return cmd + args
+    if preset == "claude":
+        return ["claude", *args]
+    return args
+
+
 # ---------------------------------------------------------------- commands
 @app.command()
 def generate(
@@ -319,6 +471,70 @@ def chat(
 
 
 @app.command()
+def serve(
+    port: Annotated[int, typer.Option("--port", "-p")] = 8000,
+    host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
+    effort: Annotated[str, typer.Option("--effort", "-e", help="Injected when a client sends no reasoning control; none = leave requests alone")] = cfg.PROXY_EFFORT,
+) -> None:
+    """Local OpenAI-, Anthropic- and Responses-compatible endpoint forwarding to the Modal server.
+
+    Point tools at http://127.0.0.1:PORT (Anthropic clients) or http://127.0.0.1:PORT/v1 (OpenAI
+    clients); any API key works. Requests travel over Modal's RPC, so nothing is exposed publicly.
+    """
+    from aiohttp import web
+
+    server = _server()
+    _cold_start_hint(server)
+    base = f"http://{host}:{port}"
+    _note(f"OpenAI-compatible: {base}/v1   Anthropic-compatible: {base}   model: {cfg.SERVED_MODEL_NAME}")
+    _note(f"default reasoning effort injected: {effort}   (Ctrl-C to stop)")
+    web.run_app(_make_proxy_app(server, _effort(effort)), host=host, port=port, print=None)
+
+
+@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def agent(
+    ctx: typer.Context,
+    preset: Annotated[str, typer.Argument(help="claude | codex | anthropic | openai (env only) ; then the tool's own arguments")],
+    effort: Annotated[str, typer.Option("--effort", "-e", help=EFFORT_HELP)] = cfg.PROXY_EFFORT,
+    warm: Annotated[bool, typer.Option("--warm/--no-warm", help="Keep one container running while the tool runs (and a bit after)")] = True,
+) -> None:
+    """Run a coding agent against this model: `dsv4 agent claude`, `dsv4 agent codex`, `dsv4 agent openai -- aider ...`.
+
+    Starts a local proxy on a free port, sets the tool's environment (and config overrides for
+    Codex), runs it, then stops the proxy. The GPU container stays warm for the idle window after.
+    """
+    if preset not in AGENT_PRESETS:
+        _fail(f"preset must be one of {', '.join(AGENT_PRESETS)}")
+    args = [a for a in ctx.args if a != "--"]
+    if preset in {"anthropic", "openai"} and not args:
+        _fail("give the command to run after the preset, e.g. `dsv4 agent openai -- aider --model openai/deepseek-v4.1-flash`")
+    tool = (_agent_command(preset, args, "http://127.0.0.1:0", None) or [preset])[0]
+    if shutil.which(tool) is None:
+        _fail(f"{tool!r} is not on PATH")
+    server = _server()
+    level = _effort(effort)
+    if warm:
+        _autoscaler(server).update(min_containers=1)
+    _cold_start_hint(server)
+    port = _free_port()
+    proxy = _ProxyThread(server, level, "127.0.0.1", port)
+    proxy.start()
+    base = f"http://127.0.0.1:{port}"
+    cmd = _agent_command(preset, args, base, level)
+    _note(f"proxy on {base}; running: {' '.join(cmd[:1] + [a for a in cmd[1:] if not a.startswith('model_providers')][:6])} ...")
+    try:
+        code = subprocess.call(cmd, env=_agent_env(preset, base, level))
+    except KeyboardInterrupt:
+        code = 130
+    finally:
+        proxy.stop()
+        if warm:
+            _autoscaler(server).update(min_containers=0)
+            _note(f"min_containers back to 0; the container stops after {cfg.SCALEDOWN_S // 60} min idle (`dsv4 down --now` stops it sooner)")
+    raise typer.Exit(code=code)
+
+
+@app.command()
 def download(
     wait: Annotated[bool, typer.Option("--wait/--no-wait")] = True,
     revision: Annotated[str, typer.Option("--revision")] = cfg.MODEL_REVISION,
@@ -351,20 +567,26 @@ def env_check() -> None:
 def up(
     hours: Annotated[float, typer.Option("--hours", min=0.1, max=24.0, help="Auto scale-down after this long")] = 2.0,
     auto_down: Annotated[bool, typer.Option("--auto-down/--no-auto-down")] = True,
+    wait: Annotated[bool, typer.Option("--wait/--no-wait", help="Block until the server is ready")] = False,
 ) -> None:
     """Keep one server container running (min_containers=1), so calls skip the cold start."""
     server = _server()
-    settings = server.generate.update_autoscaler(min_containers=1)
+    settings = _autoscaler(server).update(min_containers=1)
     typer.echo(f"min_containers={settings.min_containers} ({cfg.hourly_cost_text()})")
     if auto_down:
         call = _function("auto_down").spawn(int(hours * 3600))
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         AUTO_DOWN_FILE.write_text(json.dumps({"call_id": call.object_id, "hours": hours}))
-        typer.echo(f"auto_down job {call.object_id} will reset min_containers to 0 in {hours:g} h; `dsv4 down` does it now")
+        typer.echo(f"auto_down job {call.object_id} resets min_containers to 0 in {hours:g} h; `dsv4 down` does it now")
+    if wait:
+        info = _wait(server.info.spawn(), 15.0, "booting")
+        typer.echo(f"ready: boot {info['load_s']}s (server ready {info['ready_s']}s), tp={info['settings']['tp']}, log {info.get('log_path')}")
 
 
 @app.command()
-def down() -> None:
+def down(
+    now: Annotated[bool, typer.Option("--now", help="Also stop the idle container right away instead of after the idle window")] = False,
+) -> None:
     """Let the server scale to zero again (and cancel a pending auto_down)."""
     import modal
 
@@ -376,32 +598,73 @@ def down() -> None:
         except Exception as exc:  # noqa: BLE001 - already finished or gone
             typer.echo(f"auto_down job not cancelled ({exc})", err=True)
         AUTO_DOWN_FILE.unlink(missing_ok=True)
-    settings = _server().generate.update_autoscaler(min_containers=0)
-    typer.echo(f"min_containers={settings.min_containers}; idle containers stop after {cfg.SCALEDOWN_S // 60} min")
+    server = _server()
+    settings = _autoscaler(server).update(min_containers=0)
+    if not now:
+        typer.echo(f"min_containers={settings.min_containers}; idle containers stop after {cfg.SCALEDOWN_S // 60} min")
+        return
+    # `modal container stop` gets the container replaced while the autoscaler still wants one; a
+    # 2-second idle window makes the autoscaler itself retire it, with no replacement.
+    _autoscaler(server).update(scaledown_window=2)
+    try:
+        t0 = time.monotonic()
+        while _containers() and time.monotonic() - t0 < 300:
+            typer.echo(f"\r  waiting for the container to stop ... {int(time.monotonic() - t0)}s", nl=False, err=True)
+            time.sleep(10)
+        typer.echo("", err=True)
+    finally:
+        _autoscaler(server).update(scaledown_window=cfg.SCALEDOWN_S)
+    typer.echo("stopped" if not _containers() else "still running (busy?); it stops after the idle window")
 
 
 @app.command()
 def status() -> None:
     """Autoscaler settings, running containers and the configured GPU."""
-    handle = _server().generate
+    server = _server()
     try:
-        settings = handle.autoscaler.settings()
+        settings = _autoscaler(server).settings()
         typer.echo(
             f"autoscaler: min={settings.min_containers} max={settings.max_containers} "
             f"buffer={settings.buffer_containers} scaledown_window={settings.scaledown_window}s"
         )
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"autoscaler settings unavailable: {exc}", err=True)
-    running = _running_containers(handle)
-    typer.echo(f"running containers: {running if running is not None else 'unknown'}")
+    containers = _containers()
+    typer.echo(f"running containers: {len(containers)}" + (f" ({', '.join(c.get('Container ID', c.get('container_id', '?')) for c in containers)})" if containers else ""))
     typer.echo(f"deploy-time gpu spec: {cfg.GPU_SPEC} ({cfg.hourly_cost_text()} per container)")
     if AUTO_DOWN_FILE.exists():
         typer.echo(f"pending auto_down: {AUTO_DOWN_FILE.read_text().strip()}")
     if cfg.WEB_SERVER:
         try:
-            typer.echo(f"openai-compatible url: {_server().api.get_web_url()}")
+            typer.echo(f"openai-compatible url: {server.api.get_web_url()}")
         except Exception as exc:  # noqa: BLE001
             typer.echo(f"web url unavailable: {exc}", err=True)
+
+
+@app.command()
+def logs(
+    tail: Annotated[int, typer.Option("--tail", "-n", help="Lines from the end")] = 200,
+    list_logs: Annotated[bool, typer.Option("--list", help="List the stored boot logs instead")] = False,
+    name: Annotated[str | None, typer.Option("--name", help="A specific log file name from --list")] = None,
+) -> None:
+    """Show the SGLang log of the latest (or a given) boot, stored on the cache Volume."""
+    import modal
+
+    volume = modal.Volume.from_name(cfg.CACHE_VOLUME)
+    rel = str(cfg.LOG_DIR.relative_to(cfg.CACHE_DIR))
+    try:
+        entries = sorted(e.path for e in volume.listdir(rel))
+    except Exception as exc:  # noqa: BLE001
+        _fail(f"no logs yet ({exc})")
+    if list_logs:
+        for entry in entries:
+            typer.echo(entry)
+        return
+    if not entries:
+        _fail("no logs yet")
+    path = f"{rel}/{name}" if name else entries[-1]
+    text = b"".join(volume.read_file(path)).decode("utf-8", errors="replace")
+    typer.echo("\n".join(text.splitlines()[-tail:]))
 
 
 @jobs_app.command("status")

@@ -24,6 +24,7 @@ MODEL_DIR = MODELS_DIR / MODEL_ID
 # /root/.cache becomes a symlink to it, so every library's default cache lands on the Volume.
 CACHE_DIR = PurePosixPath("/cache")
 IMAGE_CACHE_SEED = PurePosixPath("/opt/image-cache")  # the image's original /root/.cache, see app.py
+LOG_DIR = CACHE_DIR / "logs"  # one SGLang log per boot, readable later with `dsv4 logs`
 
 _EXPORTED: dict[str, str] = {}
 
@@ -98,7 +99,16 @@ CUDA_GRAPH_MAX_BS = _env_int("DSV4_CUDA_GRAPH_MAX_BS", 8)
 CHUNKED_PREFILL = _env_int("DSV4_CHUNKED_PREFILL", 4096)
 REASONING_PARSER = _env("DSV4_REASONING_PARSER", "deepseek-v41")  # explicit: `auto` leaks <think> on older builds
 TOOL_CALL_PARSER = _env("DSV4_TOOL_CALL_PARSER", "deepseekv41")
-DEFAULT_EFFORT = _env("DSV4_DEFAULT_EFFORT", "high")  # server default; the CLI sends one per request anyway
+DEFAULT_EFFORT = _env("DSV4_DEFAULT_EFFORT", "high")  # effort used when a request turns thinking on without a level
+# Thinking for requests that say nothing about it. Off: such requests get a plain answer. On: SGLang
+# puts the model in thinking mode but (this build) leaves the reasoning parser off, so the reasoning
+# leaks into `content` with a stray </think>. Clients that want reasoning ask for it per request
+# (reasoning_effort / thinking / reasoning.effort); the CLI and `dsv4 serve` always do.
+DEFAULT_THINKING = _env_bool("DSV4_DEFAULT_THINKING", False)
+PROXY_EFFORT = _env("DSV4_PROXY_EFFORT", "high")  # what `dsv4 serve` injects when a client sends no effort
+# FlashInfer autotune took 6.5 min of a 15 min boot on 4xB200 even with its cache on the Volume.
+# Turning it off boots faster at some kernel-throughput cost; measure before relying on it.
+FLASHINFER_AUTOTUNE = _env_bool("DSV4_FLASHINFER_AUTOTUNE", True)
 SPECULATIVE = _env("DSV4_SPECULATIVE", "")  # "" or "dspark" (draft head quality is doubtful on this build)
 DSPARK_BLOCK_SIZE = _env_int("DSV4_DSPARK_BLOCK_SIZE", 5)
 FAST_LOAD = _env_bool("DSV4_FAST_LOAD", True)  # multithreaded safetensors load + prefetch (newer builds only)

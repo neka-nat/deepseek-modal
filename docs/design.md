@@ -161,6 +161,25 @@ vLLM 0.31.0 以降は V4.1-Flash を公式サポート（recipe: H200 は TP4 + 
 - 初回起動実測（4×B200、JIT キャッシュなし）: 重み読み込み 276 秒、スケジューラ起動（JIT 含む）792 秒、CUDA graph 49 秒、`/health` まで 871 秒。CLI から見た総時間 15 分 25 秒（GPU 代約 $6.5）。
 - 推論実測（warm、単一ストリーム）: 約 290〜300 tok/s、TTFT 0.2〜0.3 秒。effort=high で 4096 トークンの生成が 14.4 秒。6 章の見積（100 tok/s）より大幅に速い。
 
+## Coding agent として使うための調査（2026-10-19 追記）
+
+実機（4×B200、SGLang nightly 684fea8a）で確認した事実:
+
+- SGLang は `/v1/chat/completions`（OpenAI）、`/v1/messages`（Anthropic。`count_tokens` も可）、`/v1/responses`（OpenAI Responses）を同時に提供する。いずれもツール呼び出し（`tool_calls` / `tool_use` / `function_call`）とストリーミングが動作した。
+- thinking を要求しないリクエストの扱い: `SGLANG_DEFAULT_THINKING=1` だと reasoning が `content` に漏れて `</think>` が混入する（モデルカードの警告どおり）。`0` だと素の回答になる。`reasoning_effort`（chat）、`thinking: {type: enabled|adaptive}` や `output_config.effort`（Anthropic）、`reasoning.effort`（Responses）を付ければ正しく分離される。→ サーバ既定は `0` にし、`dsv4 serve` が effort を補う。
+- Claude Code が送る `thinking: adaptive`、`output_config.effort`（`CLAUDE_CODE_EFFORT_LEVEL`）、`cache_control`、`strict` ツール、`context_management` はすべて 200 で受理された。
+- Codex は `wire_api = "responses"` のみ対応。SGLang の Responses 実装は `instructions` / function tools / `reasoning.effort` / ストリーミングに対応していた。
+- `max_tokens` 未指定でも 128 トークンで切れることはなかった（322 トークン生成）。
+
+採用した構成: `dsv4 serve`（ローカル aiohttp → Modal RPC `proxy` メソッド → コンテナ内 SGLang への素通し + model 名の書き換え + effort 注入）と、`dsv4 agent claude|codex|openai|anthropic` ラッパ。Modal の web endpoint は 150 秒の HTTP 制限と Proxy Token の管理が必要になるため、ローカル経路を主にした（`DSV4_WEB=1` で併用可）。
+
+起動時間の内訳（2 回目、JIT キャッシュあり、4×B200）: Python 初期化 約 150 秒、並列初期化 74 秒、重み読み込み 138 秒（1 回目は 276 秒）、FlashInfer autotune 393 秒、CUDA graph 93 秒、合計 887 秒。3 回目も 910 秒（autotune 434 秒）。autotune のキャッシュファイルは Volume に残っているが効いていない。
+4 回目に `DSV4_FLASHINFER_AUTOTUNE=0` で起動したところ autotune フェーズは消えたが CUDA graph 取得が 488 秒に伸び、合計 876 秒で変わらず。生成速度も 295 tok/s で同じ。つまり約 7 分はカーネルのチューニングそのもので、このビルドでは回避できない。起動を短くする手段は「温めておく」（`dsv4 up --wait`、$25/h）しかない。
+
+coding agent の実機テスト（`dsv4 agent`、warm 状態）: Claude Code の `-p` モードで README を Read ツールで読んで正答（55 秒、起動込み）、Codex の `exec` モードで shell ツール経由で正答（11〜15 秒）。`dsv4 serve` 経由の 3 API も effort 注入込みで reasoning が分離されることを確認。
+
+運用上の注意: `modal container stop` はアイドル窓の中では autoscaler に即座に置き換えられる（実測）。`dsv4 down --now` は `scaledown_window` を一時的に 2 秒にして自然に落とす。
+
 ## 参考リンク
 
 - モデルカード: https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8

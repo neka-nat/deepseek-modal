@@ -144,7 +144,7 @@ def weights_status(revision: str = cfg.MODEL_REVISION) -> dict:
 
 
 # ------------------------------------------------------------------ image sanity check (no GPU)
-@app.function(image=server_image, cpu=4, memory=16 * 1024, timeout=1800)
+@app.function(image=server_image, cpu=4, memory=16 * 1024, timeout=1800, volumes={str(cfg.CACHE_DIR): cache_volume})
 def env_check() -> dict:
     """Versions, flags and files inside the SGLang image (`dsv4 env-check`)."""
     import importlib
@@ -265,6 +265,9 @@ class DeepSeekServer:
             reasoning_parser=cfg.REASONING_PARSER,
             tool_call_parser=cfg.TOOL_CALL_PARSER,
             default_effort=cfg.DEFAULT_EFFORT,
+            default_thinking=cfg.DEFAULT_THINKING,
+            flashinfer_autotune=cfg.FLASHINFER_AUTOTUNE,
+            log_dir=str(cfg.LOG_DIR),
             speculative=cfg.SPECULATIVE,
             dspark_block_size=cfg.DSPARK_BLOCK_SIZE,
             engram_host_table=cfg.ENGRAM_HOST_TABLE,
@@ -307,10 +310,20 @@ class DeepSeekServer:
         return self.server.complete(GenerationRequest.model_validate(request)).model_dump()
 
     @modal.method()
+    def proxy(
+        self, method: str, path: str, headers: dict, body: bytes | None, effort: str | int | None = None
+    ) -> Iterator[dict]:
+        """Raw passthrough for `dsv4 serve`: any SGLang route (chat, messages, responses, models)."""
+        yield from self.server.forward(
+            method, path, headers, body, default_effort=effort, model_override=cfg.SERVED_MODEL_NAME
+        )
+
+    @modal.method()
     def info(self) -> dict:
         return {
             "gpu": cfg.GPU_SPEC,
             "image": cfg.IMAGE,
+            "log_path": str(self.server.log_path) if self.server.log_path else None,
             "load_s": self.load_s,
             "ready_s": round(self.ready_s),
             "warmup_s": self.warmup_s,
@@ -330,8 +343,8 @@ class DeepSeekServer:
 def auto_down(delay_s: int) -> dict:
     """Sleep, then let the server scale to zero again (`dsv4 up --hours N` spawns this)."""
     time.sleep(max(0, min(delay_s, 24 * 3600 - 600)))
-    handle = modal.Cls.from_name(cfg.APP_NAME, "DeepSeekServer")().generate
-    settings = handle.update_autoscaler(min_containers=0)
+    server = modal.Cls.from_name(cfg.APP_NAME, "DeepSeekServer")()
+    settings = server.generate.autoscaler.update(min_containers=0)  # the pool is shared by all methods
     return {"min_containers": settings.min_containers, "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
 

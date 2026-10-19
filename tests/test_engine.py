@@ -49,6 +49,11 @@ def test_build_command_options():
     assert cmd[-2:] == ["--foo", "a b"]
 
 
+def test_build_command_autotune_toggle():
+    assert "--disable-flashinfer-autotune" not in build_command(_settings())
+    assert "--disable-flashinfer-autotune" in build_command(_settings(flashinfer_autotune=False))
+
+
 def test_build_command_rejects_unknown_speculative():
     with pytest.raises(ValueError):
         build_command(_settings(speculative="eagle"))
@@ -59,8 +64,10 @@ def test_build_env_engram_toggle():
     assert off["PATH"] == "/bin"
     assert off["SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE"] == "0"
     assert "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT" not in off
-    assert off["SGLANG_DEFAULT_THINKING"] == "1" and off["SGLANG_DSV41_REASONING_EFFORT"] == "high"
-    on = build_env(_settings(engram_host_table=True, default_effort="max"), base={})
+    assert off["SGLANG_DEFAULT_THINKING"] == "0" and off["SGLANG_DSV41_REASONING_EFFORT"] == "high"
+    assert off["PYTHONUNBUFFERED"] == "1"
+    on = build_env(_settings(engram_host_table=True, default_effort="max", default_thinking=True), base={})
+    assert on["SGLANG_DEFAULT_THINKING"] == "1"
     assert on["SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE"] == "1"
     assert on["SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT"] == "per_rank"
     assert on["SGLANG_DSV41_REASONING_EFFORT"] == "max"

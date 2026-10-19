@@ -10,6 +10,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -37,6 +38,9 @@ class EngineSettings:
     reasoning_parser: str = "deepseek-v41"
     tool_call_parser: str = "deepseekv41"
     default_effort: str = "high"
+    default_thinking: bool = False  # SGLANG_DEFAULT_THINKING; see config.DEFAULT_THINKING
+    flashinfer_autotune: bool = True
+    log_dir: str | None = None  # tee the server output into <log_dir>/sglang-<timestamp>.log
     speculative: str = ""  # "" or "dspark"
     dspark_block_size: int = 5
     engram_host_table: bool = False
@@ -79,6 +83,8 @@ def build_command(settings: EngineSettings) -> list[str]:
             "--model-loader-extra-config", json.dumps({"enable_multithread_load": True}),
             "--weight-loader-prefetch-checkpoints",
         ]  # fmt: skip
+    if not s.flashinfer_autotune:
+        cmd.append("--disable-flashinfer-autotune")
     speculative = s.speculative.strip().lower()
     if speculative == "dspark":
         cmd += ["--speculative-algorithm", "DSPARK", "--speculative-dspark-block-size", str(s.dspark_block_size)]
@@ -93,7 +99,8 @@ def build_env(settings: EngineSettings, base: Mapping[str, str] | None = None) -
     env = dict(os.environ if base is None else base)
     env.update(
         {
-            "SGLANG_DEFAULT_THINKING": "1",
+            "PYTHONUNBUFFERED": "1",  # the server output goes through a pipe (tee); keep it live
+            "SGLANG_DEFAULT_THINKING": "1" if settings.default_thinking else "0",
             "SGLANG_DSV41_REASONING_EFFORT": settings.default_effort,
             "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1" if settings.engram_host_table else "0",
             "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
@@ -164,6 +171,54 @@ def seed_cache_dir(seed: Path | str, target: Path | str, log: Logger = print) ->
     if copied:
         log(f"seeded {target_path} from image: {', '.join(copied)}")
     return copied
+
+
+# ------------------------------------------------------------------ request normalization (pure)
+DROPPED_REQUEST_HEADERS = frozenset(
+    {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "te", "upgrade",
+     "proxy-authorization", "proxy-connection", "authorization", "x-api-key", "accept-encoding"}
+)  # fmt: skip
+KEPT_RESPONSE_HEADERS = frozenset({"content-type", "cache-control", "x-request-id"})
+
+
+def _thinking_requested_chat(body: dict) -> bool:
+    kwargs = body.get("chat_template_kwargs") or {}
+    return "reasoning_effort" in body or "thinking" in kwargs or "reasoning_effort" in kwargs
+
+
+def normalize_request(
+    path: str, body: dict, default_effort: str | int | None, model_override: str | None = None
+) -> dict:
+    """Fill in what agent clients usually leave out, for the three API flavours SGLang serves.
+
+    - the served model name (clients send whatever they were configured with)
+    - a reasoning effort when the request says nothing about thinking, so the answer comes back
+      with reasoning separated instead of plain (server default) or leaked (SGLANG_DEFAULT_THINKING=1)
+    """
+    out = dict(body)
+    route = path.split("?", 1)[0].rstrip("/")
+    if model_override and "model" in out:
+        out["model"] = model_override
+    if default_effort is None:
+        return out
+    if route.endswith("/chat/completions"):
+        if not _thinking_requested_chat(out):
+            if isinstance(default_effort, int):
+                out["chat_template_kwargs"] = {**(out.get("chat_template_kwargs") or {}), "thinking": True, "reasoning_effort": default_effort}
+            else:
+                out["reasoning_effort"] = default_effort
+    elif route.endswith("/messages"):
+        if out.get("thinking") is None:
+            out["thinking"] = {"type": "enabled", "budget_tokens": 16000}  # SGLang ignores the budget
+        if isinstance(default_effort, str) and not (out.get("output_config") or {}).get("effort"):
+            out["output_config"] = {**(out.get("output_config") or {}), "effort": default_effort}
+    elif route.endswith("/responses"):
+        if out.get("reasoning") is None and "reasoning_effort" not in (out.get("chat_template_kwargs") or {}):
+            if isinstance(default_effort, int):
+                out["chat_template_kwargs"] = {**(out.get("chat_template_kwargs") or {}), "thinking": True, "reasoning_effort": default_effort}
+            else:
+                out["reasoning"] = {"effort": default_effort}
+    return out
 
 
 # ------------------------------------------------------------------ SSE parsing (pure)
@@ -253,8 +308,16 @@ class SGLangServer:
     def start(self) -> None:
         cmd = build_command(self.settings)
         self.log("launching: " + " ".join(shlex.quote(c) for c in cmd))
-        # Logs are inherited so they show up in the Modal container logs.
-        self.process = subprocess.Popen(cmd, env=build_env(self.settings), start_new_session=True)
+        env = build_env(self.settings)
+        self.log_path: Path | None = None
+        if self.settings.log_dir:
+            self.log_path = Path(self.settings.log_dir) / time.strftime("sglang-%Y%m%d-%H%M%S.log")
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            env["DSV4_SERVER_LOG"] = str(self.log_path)
+            # Output goes to the container log (Modal) and to a file on the cache Volume (`dsv4 logs`).
+            cmd = ["bash", "-c", 'exec "$@" 2>&1 | tee -a "$DSV4_SERVER_LOG"', "sglang", *cmd]
+            self.log(f"server log: {self.log_path}")
+        self.process = subprocess.Popen(cmd, env=env, start_new_session=True)
 
     def wait_ready(self, timeout_s: float, poll_s: float = 5.0) -> float:
         """Block until /health answers 200; raise if the server exits or the budget runs out."""
@@ -299,12 +362,64 @@ class SGLangServer:
     def stop(self, grace_s: float = 30.0) -> None:
         if self.process is None or self.process.poll() is not None:
             return
-        self.process.terminate()
+        # The server runs in its own session (start_new_session) so the whole group, including the
+        # scheduler subprocesses and the tee, gets the signal.
+        try:
+            os.killpg(self.process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
         try:
             self.process.wait(timeout=grace_s)
         except subprocess.TimeoutExpired:
-            self.process.kill()
+            os.killpg(self.process.pid, signal.SIGKILL)
             self.process.wait(timeout=10)
+
+    def forward(
+        self,
+        method: str,
+        path: str,
+        headers: Mapping[str, str],
+        body: bytes | None,
+        *,
+        default_effort: str | int | None = None,
+        model_override: str | None = None,
+        flush_s: float = 0.05,
+        flush_bytes: int = 16384,
+    ) -> Iterator[dict]:
+        """Raw HTTP passthrough to the SGLang server for `dsv4 serve`.
+
+        Yields `{"status", "headers"}` first, then `{"data": bytes}` chunks (SSE or a whole body),
+        batched a little so a Modal generator ships at most ~20 messages per second.
+        """
+        import httpx
+
+        payload = body
+        content_type = next((v for k, v in headers.items() if k.lower() == "content-type"), "")
+        if body and content_type.startswith("application/json"):
+            try:
+                data = json.loads(body)
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                payload = json.dumps(normalize_request(path, data, default_effort, model_override)).encode()
+        forwarded = {k: v for k, v in headers.items() if k.lower() not in DROPPED_REQUEST_HEADERS}
+        timeout = httpx.Timeout(connect=10.0, read=None, write=120.0, pool=10.0)
+        with httpx.Client(timeout=timeout) as client:
+            with client.stream(method, f"{self.base_url}{path}", headers=forwarded, content=payload) as response:
+                yield {
+                    "status": response.status_code,
+                    "headers": {k: v for k, v in response.headers.items() if k.lower() in KEPT_RESPONSE_HEADERS},
+                }
+                buffer = bytearray()
+                last_flush = time.monotonic()
+                for chunk in response.iter_bytes():
+                    buffer += chunk
+                    if len(buffer) >= flush_bytes or time.monotonic() - last_flush >= flush_s:
+                        yield {"data": bytes(buffer)}
+                        buffer.clear()
+                        last_flush = time.monotonic()
+                if buffer:
+                    yield {"data": bytes(buffer)}
 
     def stream_chat(self, request: GenerationRequest) -> Iterator[StreamChunk]:
         """Stream one chat completion as coalesced chunks; the final chunk carries timings."""
